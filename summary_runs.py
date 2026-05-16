@@ -64,6 +64,7 @@ import sys
 import glob
 import math
 import warnings
+from scipy import stats
 
 
 # ============================================================
@@ -87,6 +88,7 @@ M_tot = 1.0
 b     = 1.0
 G     = 1.0
 mass  = M_tot / N
+eps   = 0.012          # softening length used in the treecode
 
 # [PHYSICS] Central density and Dynamical Time (Crossing Time).
 rho_c       = 3.0 * M_tot / (4.0 * math.pi * b**3)
@@ -558,16 +560,53 @@ def jeans_profile(pos, vel, n_bins=18):
     sig_r  = np.full(n_bins, np.nan)
     sig_t  = np.full(n_bins, np.nan)
     ratio  = np.full(n_bins, np.nan)
+    counts = np.zeros(n_bins, dtype=float)
     for k in range(n_bins):
         mask = (r >= bins[k]) & (r < bins[k+1])
-        if mask.sum() > 5:
+        counts[k] = mask.sum()
+        if counts[k] > 5:
             sr = np.std(vr[mask])
             st = np.sqrt(np.mean(vt2[mask]) / 2.0)
             sig_r[k] = sr
             sig_t[k] = st
             if sr > 0:
                 ratio[k] = st / sr
-    return r_mid, sig_r, sig_t, ratio
+    return r_mid, sig_r, sig_t, ratio, counts
+
+
+def compute_reduced_chi2(obs, exp, sigma, dof_adj=0):
+    """
+    Reduced chi-squared (chi2/nu) and p-value.
+
+    Uses the standard Pearson formulation: each term is (O-E)^2 / sigma^2
+    where sigma should be based on the EXPECTED value (e.g. rho_th/sqrt(N_bin))
+    to avoid instability when observed counts fluctuate near zero.
+
+    Parameters
+    ----------
+    obs, exp, sigma : array-like
+        Observed values, expected values, and per-bin uncertainties.
+    dof_adj : int
+        Number of constraints imposed that reduce the DOF (e.g. 1 if the
+        theory was renormalised to match the data total).
+        Default 0: use unless a parameter was explicitly fitted/normalised.
+
+    Returns
+    -------
+    chi2_nu : float  (reduced chi-squared = chi2 / nu)
+    p_val   : float  (p-value from chi2 CDF with nu = n_bins - dof_adj DOF)
+    """
+    obs   = np.asarray(obs,   dtype=float)
+    exp   = np.asarray(exp,   dtype=float)
+    sigma = np.asarray(sigma, dtype=float)
+    mask  = (exp > 0) & (sigma > 0) & np.isfinite(obs) & np.isfinite(exp)
+    n_eff = int(mask.sum())
+    if n_eff <= dof_adj:
+        return np.nan, np.nan
+    chi2  = np.sum(((obs[mask] - exp[mask]) / sigma[mask])**2)
+    dof   = n_eff - dof_adj
+    p_val = 1.0 - stats.chi2.cdf(chi2, dof)
+    return chi2 / dof, p_val
 
 
 def get_mid_snapshot(filepath, N, t_target, has_phi=True):
@@ -907,7 +946,7 @@ print("Saved: summary_orbits.pdf")
 # [PHYSICS] rho(r) = (3M/4pi b^3)*(1 + r^2/b^2)^{-5/2}
 # Three time panels verify the profile is unchanged by the dynamics.
 # Error bars = Poisson: sigma_rho = rho / sqrt(N_bin).
-# Orange points = r < b (softening-dominated region).
+# Symmetric linear error bars: sigma = rho / sqrt(N_bin).
 
 t_mid_target = times[-1] / 2.0
 pos_mid, vel_mid, phi_mid, t_mid_actual = get_mid_snapshot(
@@ -919,30 +958,24 @@ r_theory   = np.logspace(-1.5, np.log10(max_r_last), 300)
 rho_th     = plummer_rho(r_theory, M_tot, b)
 
 fig3, axes3 = plt.subplots(1, 3, figsize=(14, 5))
-fig3.suptitle('Density profile vs Plummer theory  (b=%.1f, dashed = softening r=b)' % b)
 
 for col_idx, (label, pos_s, t_s) in enumerate([
-        ('t=0',                         pos_initial, times[0]),
-        ('t=%.2f' % t_mid_actual,        pos_mid,    t_mid_actual),
-        ('t=%.2f (final)' % times[-1],  pos_last,    times[-1])]):
+        ('t=0',                        pos_initial, times[0]),
+        ('t=%.2f' % t_mid_actual,      pos_mid,    t_mid_actual),
+        ('t=%.2f' % times[-1],         pos_last,    times[-1])]):
 
     ax   = axes3[col_idx]
     cm_s = np.mean(pos_s, axis=0)
     r_m, rho_m, cnts = bin_density_profile(pos_s, cm_s, mass)
 
     if r_m is not None:
-        inside  = r_m < b
-        outside = ~inside
-        if outside.any():
-            err = rho_m[outside] / np.sqrt(cnts[outside])
-            ax.errorbar(r_m[outside], rho_m[outside], yerr=err,
-                        fmt='o', ms=3, color='blue', label='N-body')
-        if inside.any():
-            ax.scatter(r_m[inside], rho_m[inside], s=10, color='orange',
-                       label='inside b (softened)')
+        log_sigma = 1.0 / np.sqrt(cnts)          # sigma in log10 units
+        err_up  = rho_m * (10.0**log_sigma - 1.0)
+        err_low = rho_m * (1.0 - 10.0**(-log_sigma))
+        ax.errorbar(r_m, rho_m, yerr=[err_low, err_up],
+                    fmt='o', ms=3, color='k', label='N-body')
 
-    ax.plot(r_theory, rho_th, 'r-', label='Plummer theory')
-    ax.axvline(b, color='orange', ls='--', label='r = b')
+    ax.plot(r_theory, rho_th, 'r--', label='Plummer theory')
     ax.set_xscale('log')
     ax.set_yscale('log')
     ax.set_xlabel('r')
@@ -963,6 +996,19 @@ print("Saved: summary_density.pdf")
 # [PHYSICS] M(<r): sort particle radii, M(<r_i) = i * m.
 # v_circ(r) = sqrt(G M(<r) / r) — structural IC check.
 
+# ============================================================
+#  FIGURE 4: CUMULATIVE MASS AND CIRCULAR VELOCITY — initial vs final
+# ============================================================
+# [PHYSICS] M(<r) and v_circ = sqrt(G M(<r) / r).
+# Comparing t=0 and t=final proves the mass distribution is stable.
+
+# ============================================================
+#  FIGURE 4: CUMULATIVE MASS AND CIRCULAR VELOCITY — initial vs final
+# ============================================================
+# [PHYSICS] M(<r): sort particle radii, M(<r_i) = i * m.
+# v_circ(r) = sqrt(G M(<r) / r) — structural check.
+
+# --- Calcoli per lo snapshot INIZIALE ---
 _cm_init  = np.mean(pos_initial, axis=0)
 _r_init   = np.linalg.norm(pos_initial - _cm_init, axis=1)
 _r_sorted = np.sort(_r_init)
@@ -971,31 +1017,62 @@ _mask_vc  = _r_sorted > 0.01
 _r_vc     = _r_sorted[_mask_vc]
 _vcirc_s  = np.sqrt(G * _M_cum[_mask_vc] / _r_vc)
 
-r_th_vc  = np.logspace(-2, np.log10(np.max(_r_vc)), 500)
+# --- Calcoli per lo snapshot FINALE ---
+_cm_last  = np.mean(pos_last, axis=0)
+_r_last   = np.linalg.norm(pos_last - _cm_last, axis=1)
+_r_sorted_last = np.sort(_r_last)
+_mask_vc_last  = _r_sorted_last > 0.01
+_r_vc_last     = _r_sorted_last[_mask_vc_last]
+_vcirc_s_last  = np.sqrt(G * _M_cum[_mask_vc_last] / _r_vc_last)
+
+# --- Curve Teoriche (Plummer) ---
+# Usiamo il raggio massimo tra i due snapshot per la linea teorica
+r_max_plot = max(np.max(_r_vc), np.max(_r_vc_last))
+r_th_vc  = np.logspace(-2, np.log10(r_max_plot), 500)
 M_th_vc  = M_tot * r_th_vc**3 / (b**3 * (1.0 + (r_th_vc/b)**2)**1.5)
 vc_th    = np.sqrt(G * M_th_vc / r_th_vc)
 
-fig4, (ax4a, ax4b) = plt.subplots(1, 2, figsize=(11, 5))
-fig4.suptitle('Cumulative mass and circular velocity — initial snapshot  (t=%.2f)' % times[0])
+# Creazione del plot: 2 righe (vcirc, M), 2 colonne (initial, final)
+fig4, axes4 = plt.subplots(2, 2, figsize=(12, 10))
+fig4.suptitle('Structural Evolution: Mass and Rotation Curve (t=0.00 vs t=%.2f)' % times[-1], fontsize=16)
 
-ax4a.plot(r_th_vc, M_th_vc, 'r-', label='Plummer theory')
-ax4a.plot(_r_vc,   _M_cum[_mask_vc], 'b--', lw=0.8, label='N-body')
-ax4a.axhline(M_tot, color='k', ls=':', label='M_tot')
-ax4a.set_xlabel('r [code units]')
-ax4a.set_ylabel('M(<r)')
-ax4a.set_title('cumulative mass')
-ax4a.legend()
-ax4a.grid(True)
+# --- RIGA 1: CIRCULAR VELOCITY ---
+# Initial
+axes4[0, 0].plot(r_th_vc, vc_th,    'r--',  label='Plummer theory')
+axes4[0, 0].plot(_r_vc,   _vcirc_s, 'k', lw=0.8, label='N-body (initial)')
+axes4[0, 0].set_ylabel('v_circ')
+axes4[0, 0].set_title('Circular Velocity (t=0)')
+axes4[0, 0].legend()
+axes4[0, 0].grid(True)
 
-ax4b.plot(r_th_vc, vc_th,    'r-',  label='Plummer theory')
-ax4b.plot(_r_vc,   _vcirc_s, 'b--', lw=0.8, label='N-body')
-ax4b.set_xlabel('r [code units]')
-ax4b.set_ylabel('v_circ')
-ax4b.set_title('circular velocity')
-ax4b.legend()
-ax4b.grid(True)
+# Final
+axes4[0, 1].plot(r_th_vc, vc_th,         'r--',  label='theory')
+axes4[0, 1].plot(_r_vc_last, _vcirc_s_last, 'k', lw=0.8, label='N-body')
+axes4[0, 1].set_title('Circular Velocity (t=final)')
+axes4[0, 1].legend()
+axes4[0, 1].grid(True)
 
-plt.tight_layout()
+# --- RIGA 2: CUMULATIVE MASS ---
+# Initial
+axes4[1, 0].plot(r_th_vc, M_th_vc, 'r-', label='theory')
+axes4[1, 0].plot(_r_vc,   _M_cum[_mask_vc], 'b--', lw=0.8, label='N-body')
+axes4[1, 0].axhline(M_tot, color='k', ls=':', label='M_tot')
+axes4[1, 0].set_xlabel('r [code units]')
+axes4[1, 0].set_ylabel('M(<r)')
+axes4[1, 0].set_title('Cumulative Mass (t=0)')
+axes4[1, 0].legend()
+axes4[1, 0].grid(True)
+
+# Final
+axes4[1, 1].plot(r_th_vc, M_th_vc, 'r-', label='Plummer theory')
+axes4[1, 1].plot(_r_vc_last, _M_cum[_mask_vc_last], 'b--', lw=0.8, label='N-body (final)')
+axes4[1, 1].axhline(M_tot, color='k', ls=':', label='M_tot')
+axes4[1, 1].set_xlabel('r [code units]')
+axes4[1, 1].set_title('Cumulative Mass (t=final)')
+axes4[1, 1].legend()
+axes4[1, 1].grid(True)
+
+plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 plt.savefig("summary_mass_vcirc.pdf")
 plt.close(fig4)
 print("Saved: summary_mass_vcirc.pdf")
@@ -1051,7 +1128,6 @@ sigma_theory_jeans = lambda r_arr: np.sqrt(G * M_tot / (6.0 * np.sqrt(r_arr**2 +
 
 fig6, axes6 = plt.subplots(2, 2, figsize=(12, 8),
                             gridspec_kw={'height_ratios': [3, 1]})
-fig6.suptitle('Jeans equation check — sigma_r, sigma_t vs theory')
 
 for col, (label, pos_s, vel_s) in enumerate([
         ('t=0',                 pos_initial, vel_initial),
@@ -1060,7 +1136,7 @@ for col, (label, pos_s, vel_s) in enumerate([
     ax_top = axes6[0, col]
     ax_bot = axes6[1, col]
 
-    r_mid_j, sig_r_j, sig_t_j, ratio_j = jeans_profile(pos_s, vel_s)
+    r_mid_j, sig_r_j, sig_t_j, ratio_j, _cnt_j = jeans_profile(pos_s, vel_s)
 
     # Theory line spans exactly the data range
     valid = ~np.isnan(sig_r_j)
@@ -1068,21 +1144,27 @@ for col, (label, pos_s, vel_s) in enumerate([
         r_theory_j = np.logspace(np.log10(r_mid_j[valid].min()),
                                   np.log10(r_mid_j[valid].max()), 200)
         sig_th_j   = sigma_theory_jeans(r_theory_j)
-        ax_top.plot(r_theory_j, sig_th_j, 'r-', label='Jeans theory')
+        ax_top.plot(r_theory_j, sig_th_j, 'r--', label='Jeans theory')
 
-    ax_top.scatter(r_mid_j, sig_r_j, color='blue',  label='sigma_r (sim)')
-    ax_top.scatter(r_mid_j, sig_t_j, color='green', marker='s', label='sigma_t (sim, 1D)')
+    sig_th_bins = sigma_theory_jeans(r_mid_j)
+    sig_err_j   = np.where(_cnt_j > 1,
+                            sig_th_bins / np.sqrt(2.0 * np.maximum(_cnt_j - 1, 1)),
+                            np.nan)
+    ax_top.errorbar(r_mid_j, sig_r_j, yerr=sig_err_j,
+                    fmt='o', ms=3, color='blue',  label='σ_r')
+    ax_top.errorbar(r_mid_j, sig_t_j, yerr=sig_err_j,
+                    fmt='s', ms=3, color='green', label='σ_t(1D)')
     ax_top.set_xscale('log')
-    ax_top.set_ylabel('velocity dispersion')
+    ax_top.set_ylabel('σ')
     ax_top.set_title(label)
     ax_top.legend(fontsize=8)
     ax_top.grid(True)
 
-    ax_bot.axhline(1.0, color='k', ls='--', label='σ_t(1D) / σ_r = 1 (isotropic)')
+    ax_bot.axhline(1.0, color='k', ls='--', label='σ_t(1D) / σ_r = 1')
     ax_bot.scatter(r_mid_j, ratio_j, color='purple', s=15)
     ax_bot.set_xscale('log')
     ax_bot.set_ylim(0.5, 1.5)
-    ax_bot.set_xlabel('r [code units]')
+    ax_bot.set_xlabel('r')
     ax_bot.set_ylabel('σ_t(1D) / σ_r')
     ax_bot.legend(fontsize=8)
     ax_bot.grid(True)
@@ -1295,6 +1377,99 @@ if phi_last is not None:
 
 
 # ============================================================
+#  STATISTICAL GOODNESS-OF-FIT  (final snapshot)
+# ============================================================
+# Four independent tests of the Plummer equilibrium at t=final.
+#
+# Design choices (corrected vs naive approach):
+#
+#  1. Density rho(r)
+#     sigma = rho_th / sqrt(N_bin_expected)   <- Pearson: expected in denom
+#     (NOT rho_sim/sqrt(N_obs), which is unstable when a bin fluctuates low)
+#     dof_adj = 0  (theory fully specified, no free parameter)
+#     Exclude r < 2*eps to avoid the softening-dominated core.
+#
+#  2. Radial CDF — KS test instead of chi² on v_circ
+#     v_circ(r_i) = sqrt(G*i*m/r_i) is cumulative in i, so successive
+#     points share all interior particles: the covariance matrix is NOT
+#     diagonal and a chi² treating them as independent is invalid.
+#     The KS test on the raw radii vs the Plummer CDF is assumption-free
+#     and exact for continuous distributions.
+#
+#  3. Velocity distribution P(q)
+#     Pearson chi²: sigma = sqrt(E_expected) — standard and correct.
+#     dof_adj = 1 because the theory is renormalised to the data total.
+#
+#  4. Jeans velocity dispersions sigma_r(r) and sigma_t(r)
+#     sigma = sigma_th / sqrt(2*(n-1))  (standard error of sample std-dev,
+#     assuming approximately Gaussian velocities in each shell)
+#     dof_adj = 0  (no free parameter).
+#     sigma_r and sigma_t are correlated per bin (same particles), so the
+#     two chi² values are not independent; both are reported for completeness.
+
+_cm_last2  = np.mean(pos_last, axis=0)
+_r_last2   = np.linalg.norm(pos_last - _cm_last2, axis=1)
+
+# --- 1. Density ---
+_bins_chi    = np.logspace(np.log10(2.0 * eps), 1.5, 25)
+_cnt_chi, _edges_chi = np.histogram(_r_last2, bins=_bins_chi)
+_r_mid_chi   = np.sqrt(_edges_chi[:-1] * _edges_chi[1:])
+_vol_chi     = (4.0/3.0) * np.pi * (_edges_chi[1:]**3 - _edges_chi[:-1]**3)
+_rho_sim_chi = _cnt_chi * mass / _vol_chi
+_rho_th_chi  = plummer_rho(_r_mid_chi, M_tot, b)
+_cnt_th_chi  = _rho_th_chi * _vol_chi / mass          # expected counts from theory
+_sigma_rho   = _rho_th_chi / np.sqrt(np.maximum(_cnt_th_chi, 1))
+chi2_rho, p_rho = compute_reduced_chi2(
+    _rho_sim_chi, _rho_th_chi, _sigma_rho, dof_adj=0)
+
+# --- 2. Radial CDF (KS test) ---
+def _plummer_cdf(r):
+    """Plummer cumulative mass fraction: M(<r)/M_tot = r^3 / (r^2+b^2)^{3/2}"""
+    return r**3 / (r**2 + b**2)**1.5
+
+ks_stat_vc, p_vc = stats.kstest(_r_last2, _plummer_cdf)
+
+# --- 3. Velocity distribution P(q) ---
+if phi_last is not None:
+    _v_mag_chi = np.linalg.norm(vel_last, axis=1)
+    _v_esc_chi = np.sqrt(np.maximum(-2.0 * phi_last, 0.0))
+    _valid_chi = (_v_esc_chi > 0) & (_v_mag_chi / np.where(_v_esc_chi > 0, _v_esc_chi, 1.0) < 0.98)
+    _q_sim_chi = (_v_mag_chi / _v_esc_chi)[_valid_chi]
+    _qc, _qe   = np.histogram(_q_sim_chi, bins=25)
+    _qm        = 0.5 * (_qe[:-1] + _qe[1:])
+    _q_th_chi  = _qm**2 * (1.0 - _qm**2)**3.5
+    _q_th_chi *= len(_q_sim_chi) / np.sum(_q_th_chi)   # normalise to data total
+    chi2_q, p_q = compute_reduced_chi2(
+        _qc, _q_th_chi, np.sqrt(np.maximum(_q_th_chi, 1)), dof_adj=1)
+    _has_q_chi = True
+else:
+    chi2_q = p_q = np.nan
+    _has_q_chi = False
+
+# --- 4. Jeans dispersions ---
+_r_mid_jchi, _sigr_chi, _sigt_chi, _, _cnt_jchi = jeans_profile(pos_last, vel_last)
+_sig_th_jchi  = sigma_theory_jeans(_r_mid_jchi)
+_sig_err_jchi = _sig_th_jchi / np.sqrt(2.0 * np.maximum(_cnt_jchi - 1, 1))
+chi2_sigr, p_sigr = compute_reduced_chi2(
+    _sigr_chi, _sig_th_jchi, _sig_err_jchi, dof_adj=0)
+chi2_sigt, p_sigt = compute_reduced_chi2(
+    _sigt_chi, _sig_th_jchi, _sig_err_jchi, dof_adj=0)
+
+print(f"\nSTATISTICAL GOODNESS-OF-FIT  (final snapshot, t={times[-1]:.2f})")
+print(f"  rho(r)    chi2_nu={chi2_rho:6.3f}  p={p_rho:.4f}"
+      f"  [Pearson, sigma=E-based, r>2eps, dof_adj=0]")
+print(f"  CDF(r)    KS D   ={ks_stat_vc:6.4f}  p={p_vc:.4f}"
+      f"  [KS test on raw radii vs Plummer CDF]")
+if _has_q_chi:
+    print(f"  P(q)      chi2_nu={chi2_q:6.3f}  p={p_q:.4f}"
+          f"  [Pearson, sigma=sqrt(E), dof_adj=1 for norm]")
+print(f"  sigma_r   chi2_nu={chi2_sigr:6.3f}  p={p_sigr:.4f}"
+      f"  [sigma=sigma_th/sqrt(2(n-1)), dof_adj=0]")
+print(f"  sigma_t   chi2_nu={chi2_sigt:6.3f}  p={p_sigt:.4f}"
+      f"  [correlated with sigma_r per bin]")
+
+
+# ============================================================
 #  FINAL SUMMARY TABLE
 # ============================================================
 
@@ -1313,6 +1488,14 @@ print(f"  Max |Delta_E/E|:     {energy_err:.2e}  "
       f"({'PASS' if is_good else 'FAIL'})")
 if phi_last is not None:
     print(f"  Unbound particles:   {n_unbound} / {N}  ({100*n_unbound/N:.2f}%)")
+print("-" * 65)
+print(f"  STATISTICAL FITS (final snapshot)")
+print(f"    Density rho(r):    chi2_nu={chi2_rho:6.3f}  p={p_rho:.4f}")
+print(f"    Radial CDF (KS):   D      ={ks_stat_vc:6.4f}  p={p_vc:.4f}")
+if _has_q_chi:
+    print(f"    Velocity dist P(q):chi2_nu={chi2_q:6.3f}  p={p_q:.4f}")
+print(f"    Jeans sigma_r:     chi2_nu={chi2_sigr:6.3f}  p={p_sigr:.4f}")
+print(f"    Jeans sigma_t:     chi2_nu={chi2_sigt:6.3f}  p={p_sigt:.4f}")
 print("=" * 65)
 
 
@@ -1339,7 +1522,7 @@ _rho     = np.where(_cnt > 0, _cnt * mass / _vol, np.nan)
 _r_mid_d = np.sqrt(_bins_d[:-1] * _bins_d[1:])
 
 # --- Jeans / ratio profile at INITIAL snapshot (fixed log bins) ---
-_r_mid_j, _sigr, _sigt, _ratio_j = jeans_profile(pos_initial, vel_initial, n_bins=20)
+_r_mid_j, _sigr, _sigt, _ratio_j, _ = jeans_profile(pos_initial, vel_initial, n_bins=20)
 
 # --- circular velocity at INITIAL snapshot ---
 _r_sorted2  = np.sort(_r_i0)
@@ -1402,6 +1585,17 @@ np.savez(
     q_hist        = _q_hist,
     # final snapshot
     E_final       = _E_final,
+    # goodness-of-fit scalars (final snapshot)
+    chi2_rho      = np.array(chi2_rho),
+    p_rho         = np.array(p_rho),
+    ks_stat_vc    = np.array(ks_stat_vc),
+    p_vc          = np.array(p_vc),
+    chi2_q        = np.array(chi2_q),
+    p_q           = np.array(p_q),
+    chi2_sigr     = np.array(chi2_sigr),
+    p_sigr        = np.array(p_sigr),
+    chi2_sigt     = np.array(chi2_sigt),
+    p_sigt        = np.array(p_sigt),
     **lag_keys,
 )
 print("\nSaved: plummer_stats.npz")
