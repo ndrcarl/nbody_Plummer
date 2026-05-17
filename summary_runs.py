@@ -50,7 +50,7 @@
 #  - Cumulative mass M(<r) and circular velocity         -- per-run
 #
 #  SCALAR STABILITY METRICS (per run, for combined comparison):
-#  - Drift of r_hm: (r_hm_final - r_hm_initial) / r_hm_initial
+#  - Offset of r_hm: (<r_hm>_t - r_hm_theory) / r_hm_theory
 #  - Drift of sigma_v
 #  - Mean virial ratio over full run
 #  - Mean sigma_t/sigma_r at final snapshot
@@ -72,6 +72,7 @@ from scipy import stats
 # ============================================================
 
 COMBINED_MODE = (len(sys.argv) > 1 and sys.argv[1] == "--combined")
+COMBINED_TAGS = sys.argv[2:] if COMBINED_MODE and len(sys.argv) > 2 else []
 
 if not COMBINED_MODE:
     if len(sys.argv) > 1:
@@ -124,14 +125,49 @@ HAS_PHI         = True   # True means treecode output the N-body potential
 
 
 # ============================================================
+#  HELPER FUNCTIONS  (used by both per-run and combined mode)
+# ============================================================
+
+def plummer_rho(r, M, b):
+    """Analytical Plummer density: rho(r) = (3M/4pi b^3)*(1+r^2/b^2)^{-5/2}"""
+    return (3.0*M/(4.0*math.pi*b**3)) * (1.0 + (r/b)**2)**(-2.5)
+
+
+def compute_reduced_chi2(obs, exp, sigma, dof_adj=0):
+    """Reduced chi-squared and p-value (Pearson, sigma = expected-based)."""
+    obs   = np.asarray(obs,   dtype=float)
+    exp   = np.asarray(exp,   dtype=float)
+    sigma = np.asarray(sigma, dtype=float)
+    mask  = (exp > 0) & (sigma > 0) & np.isfinite(obs) & np.isfinite(exp)
+    n_eff = int(mask.sum())
+    if n_eff <= dof_adj:
+        return np.nan, np.nan
+    chi2  = np.sum(((obs[mask] - exp[mask]) / sigma[mask])**2)
+    dof   = n_eff - dof_adj
+    p_val = 1.0 - stats.chi2.cdf(chi2, dof)
+    return chi2 / dof, p_val
+
+
+# ============================================================
 #  COMBINED MODE
 # ============================================================
 
 if COMBINED_MODE:
     BASE_DIR  = os.getcwd()
-    npz_files = sorted(glob.glob(os.path.join(BASE_DIR, "run_*", "plummer_stats.npz")))
+    if COMBINED_TAGS:
+        npz_files = []
+        for tag in COMBINED_TAGS:
+            fpath = os.path.join(BASE_DIR, tag, "plummer_stats.npz")
+            if os.path.exists(fpath):
+                npz_files.append(fpath)
+            else:
+                print(f"Warning: {fpath} not found — skipping.")
+        npz_files = sorted(npz_files)
+    else:
+        npz_files = sorted(glob.glob(os.path.join(BASE_DIR, "run_*", "plummer_stats.npz")))
+
     if not npz_files:
-        print("Combined mode: no run_*/plummer_stats.npz found. Run per-run mode first.")
+        print("Combined mode: no plummer_stats.npz found. Run per-run mode first.")
         sys.exit(1)
 
     print(f"Combined mode: loading {len(npz_files)} runs.")
@@ -160,14 +196,14 @@ if COMBINED_MODE:
     rho_th_c   = (3.0*M_tot/(4.0*math.pi*b_c**3)) * (1.0 + (r_theory_c/b_c)**2)**(-2.5)
 
     figC1, axC1 = plt.subplots(figsize=(7, 5))
-    figC1.suptitle('Density profiles — %d realisations  (initial snapshot)' % n_runs)
     for g in groups:
-        axC1.plot(g["d"]["rho_r_mid"], g["d"]["rho_profile"], 'b-', alpha=0.4, lw=1.0)
-    axC1.plot(r_theory_c, rho_th_c, 'r-', lw=1.5, label='Plummer theory')
-    axC1.axvline(b_c, color='orange', ls='--', label='r = b')
+        err_up  = g["d"]["rho_profile"] * (10.0**(1.0/np.sqrt(np.maximum(g["d"]["rho_profile"]*1, 1))) - 1.0)
+        err_low = g["d"]["rho_profile"] * (1.0 - 10.0**(-1.0/np.sqrt(np.maximum(g["d"]["rho_profile"]*1, 1))))
+        axC1.plot(g["d"]["rho_r_mid"], g["d"]["rho_profile"], 'k-', alpha=0.3, lw=1.0)
+    axC1.plot(r_theory_c, rho_th_c, 'r--', lw=1.5, label='Plummer theory')
     axC1.set_xscale('log'); axC1.set_yscale('log')
     axC1.set_xlabel('r'); axC1.set_ylabel('density')
-    axC1.set_title('blue = individual runs,  red = theory')
+    axC1.set_title('Density profiles — %d realisations  (initial snapshot)' % n_runs)
     axC1.legend(); axC1.grid(True)
     plt.tight_layout()
     out = os.path.join(outdir, "combined_density.pdf")
@@ -182,12 +218,11 @@ if COMBINED_MODE:
     vcirc_th = np.sqrt(G * M_vc_th / r_vc_th)
 
     figC2, axC2 = plt.subplots(figsize=(7, 5))
-    figC2.suptitle('Circular velocity — %d realisations  (initial snapshot)' % n_runs)
     for g in groups:
-        axC2.plot(g["d"]["vcirc_r"], g["d"]["vcirc_sim"], 'b-', alpha=0.3, lw=0.8)
-    axC2.plot(r_vc_th, vcirc_th, 'r-', lw=1.5, label='Plummer theory')
+        axC2.plot(g["d"]["vcirc_r"], g["d"]["vcirc_sim"], 'k-', alpha=0.3, lw=0.8)
+    axC2.plot(r_vc_th, vcirc_th, 'r--', lw=1.5, label='Plummer theory')
     axC2.set_xlabel('r'); axC2.set_ylabel('v_circ')
-    axC2.set_title('blue = individual runs')
+    axC2.set_title('Circular velocity — %d realisations  (initial snapshot)' % n_runs)
     axC2.legend(); axC2.grid(True)
     plt.tight_layout()
     out = os.path.join(outdir, "combined_vcirc.pdf")
@@ -202,12 +237,11 @@ if COMBINED_MODE:
     p_th /= np.trapezoid(p_th, q_th)
 
     figC3, axC3 = plt.subplots(figsize=(7, 5))
-    figC3.suptitle('Velocity distribution P(q) — %d realisations  (initial snapshot)' % n_runs)
     for g in groups:
-        axC3.plot(g["d"]["q_mid"], g["d"]["q_hist"], 'b-', alpha=0.4, lw=1.0)
-    axC3.plot(q_th, p_th, 'r-', lw=1.5, label='theory q^2(1-q^2)^(7/2)')
+        axC3.plot(g["d"]["q_mid"], g["d"]["q_hist"], 'k-', alpha=0.4, lw=1.0)
+    axC3.plot(q_th, p_th, 'r--', lw=1.5, label='$P(q) \\propto q^2(1-q^2)^{7/2}$')
     axC3.set_xlabel('q = v / v_esc'); axC3.set_ylabel('probability density')
-    axC3.set_title('blue = individual runs')
+    axC3.set_title('Velocity distribution P(q) — %d realisations  (initial snapshot)' % n_runs)
     axC3.legend(); axC3.grid(True)
     plt.tight_layout()
     out = os.path.join(outdir, "combined_vel_dist.pdf")
@@ -216,31 +250,34 @@ if COMBINED_MODE:
 
     # ---- FIG C4: Jeans equation and velocity dispersion ratio (initial snapshot) ----
     # [PHYSICS] Isotropic Jeans: sigma_r^2(r) = G M_tot / (6 sqrt(r^2 + b^2))
-    # Isotropy check: sigma_t(1D)/sigma_r = 1 for isotropic velocity field.
+    # Isotropy check: sigma_theta/sigma_r = 1 for isotropic velocity field.
     # Saved from the initial snapshot in the npz.
     max_j_r = np.max([np.max(g["d"]["jeans_r_mid"]) for g in groups])
     r_j_th  = np.logspace(-1.0, np.log10(max_j_r), 200)
     sig_th  = np.sqrt(G * M_tot / (6.0 * np.sqrt(r_j_th**2 + b_c**2)))
 
     figC4, (axC4a, axC4b) = plt.subplots(1, 2, figsize=(11, 5))
-    figC4.suptitle('Jeans equation and isotropy — %d realisations  (initial snapshot)' % n_runs)
     for g in groups:
         d = g["d"]
-        axC4a.scatter(d["jeans_r_mid"], d["jeans_sigr"], s=8, color='blue',  alpha=0.3)
-        axC4a.scatter(d["jeans_r_mid"], d["jeans_sigt"], s=8, color='green', alpha=0.3)
-        axC4b.plot(d["jeans_r_mid"], d["jeans_ratio"], 'b-', alpha=0.4, lw=1.0)
+        sig_th_bins = np.sqrt(G * M_tot / (6.0 * np.sqrt(d["jeans_r_mid"]**2 + b_c**2)))
+        cnt_j = np.maximum(d["jeans_cnt"], 2) if "jeans_cnt" in d else np.full(len(d["jeans_r_mid"]), 50)
+        sig_err = sig_th_bins / np.sqrt(2.0 * (cnt_j - 1))
+        axC4a.errorbar(d["jeans_r_mid"], d["jeans_sigr"], yerr=sig_err,
+                       fmt='o', ms=2, color='blue',  alpha=0.3, lw=0.5)
+        axC4a.errorbar(d["jeans_r_mid"], d["jeans_sigt"], yerr=sig_err,
+                       fmt='s', ms=2, color='green', alpha=0.3, lw=0.5)
+        axC4b.plot(d["jeans_r_mid"], d["jeans_ratio"], 'k-', alpha=0.3, lw=1.0)
 
-    axC4a.plot(r_j_th, sig_th, 'r-', lw=1.5, label='Jeans theory')
+    axC4a.plot(r_j_th, sig_th, 'r--', lw=1.5, label='Jeans theory')
     axC4a.set_xscale('log')
     axC4a.set_xlabel('r'); axC4a.set_ylabel('velocity dispersion')
-    axC4a.set_title('blue = sigma_r,  green = sigma_t')
+    axC4a.set_title('Jeans equation — %d realisations  (initial snapshot)' % n_runs)
     axC4a.legend(); axC4a.grid(True)
 
-    axC4b.axhline(1.0, color='k', ls='--', label='σ_t / σ_r = 1 (isotropic)')
-    axC4b.axvline(b_c, color='orange', ls=':', label='r=b')
+    axC4b.axhline(1.0, color='r', ls='--', label='$\\sigma_\\theta / \\sigma_r = 1$  (isotropic)')
     axC4b.set_xscale('log'); axC4b.set_ylim(0.5, 1.5)
-    axC4b.set_xlabel('r'); axC4b.set_ylabel('σ_t(1D) / σ_r')
-    axC4b.set_title('Velocity Dispersion Ratio')
+    axC4b.set_xlabel('r'); axC4b.set_ylabel('$\\sigma_\\theta / \\sigma_r$')
+    axC4b.set_title('Isotropy ratio — %d realisations' % n_runs)
     axC4b.legend(); axC4b.grid(True)
     plt.tight_layout()
     out = os.path.join(outdir, "combined_jeans.pdf")
@@ -254,7 +291,7 @@ if COMBINED_MODE:
     lag_keys   = [f"lag_{int(f*100):02d}" for f in LAG_FRACS]
 
     figC5, (axC5a, axC5b) = plt.subplots(1, 2, figsize=(12, 5))
-    figC5.suptitle('Lagrangian radii — %d realisations  (b=%.1f, eps=0.012)' % (n_runs, b_c))
+
 
     for ki, (key, frac, col, th) in enumerate(zip(lag_keys, LAG_FRACS, colors_lag, LAG_THEORY)):
         mat      = np.array([g["d"][key] for g in groups])
@@ -282,9 +319,9 @@ if COMBINED_MODE:
         ax.legend(fontsize=8)
         ax.grid(True)
     axC5a.set_ylabel('Lagrangian radius')
-    axC5a.set_title('absolute  (band = min/max over runs)')
+    axC5a.set_title('Lagrangian radii — %d realisations  (absolute)' % n_runs)
     axC5b.set_ylabel('r / r(t=0)')
-    axC5b.set_title('normalised drift  (= 1 means stable)')
+    axC5b.set_title('Lagrangian radii — normalised  (= 1 stable)')
     plt.tight_layout()
     out = os.path.join(outdir, "combined_lagrangian.pdf")
     plt.savefig(out); plt.close(figC5)
@@ -300,7 +337,7 @@ if COMBINED_MODE:
     mvr_mat = np.array([g["d"]["mean_vr"]      for g in groups])
 
     figC6, (axC6a, axC6b, axC6c) = plt.subplots(1, 3, figsize=(14, 5))
-    figC6.suptitle('Velocity diagnostics — %d realisations  (b=%.1f, eps=0.012)' % (n_runs, b_c))
+
 
     for ax, mat, ylabel, title, ref in [
         (axC6a, vr_mat,  '2K/|W|', 'virial ratio  (= 1)',     1.0),
@@ -331,16 +368,15 @@ if COMBINED_MODE:
     # [PHYSICS] Each run reduced to three scalar stability indicators.
     # Red crosses flag runs that failed energy conservation check.
     run_ids  = np.arange(1, n_runs + 1)
-    hm_drift = np.array([float(g["d"]["r_hm_drift"])    for g in groups])
+    hm_offset = np.array([float(g["d"]["r_hm_offset"]) for g in groups])
     vir_mean = np.array([float(g["d"]["virial_mean"])   for g in groups])
     sv_drift = np.array([float(g["d"]["sigma_v_drift"]) for g in groups])
     good_arr = np.array([bool(g["d"]["is_good"])        for g in groups])
 
     figC7, (axC7a, axC7b, axC7c) = plt.subplots(1, 3, figsize=(13, 5))
-    figC7.suptitle('Scalar metrics per run — %d realisations  (eps=0.012, b=%.1f)' % (n_runs, b_c))
 
     for ax, vals, ylabel, title, ref in [
-        (axC7a, 100*hm_drift, 'r_hm drift [%]',   'half-mass radius drift  (0% = stable)', 0.0),
+        (axC7a, 100*hm_offset, 'r_hm offset [%]', 'half-mass radius offset  (0% = stable)', 0.0),
         (axC7b, vir_mean,     'mean 2K/|W|',       'time-avg virial ratio  (= 1)',          1.0),
         (axC7c, 100*sv_drift, 'sigma_v drift [%]', 'velocity dispersion drift  (0% = ok)',  0.0),
     ]:
@@ -351,7 +387,9 @@ if COMBINED_MODE:
         ax.set_xlabel('run #')
         ax.set_ylabel(ylabel)
         ax.set_title(title)
-        ax.legend(fontsize=8)
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(fontsize=8)
         ax.grid(True)
     plt.tight_layout()
     out = os.path.join(outdir, "combined_scalars.pdf")
@@ -362,7 +400,6 @@ if COMBINED_MODE:
     # [PHYSICS] E_i = (1/2)v^2 + phi. Bound: E < 0. Unbound (escaped): E > 0.
     # All particles should remain bound for a stable, correctly-sampled sphere.
     figC8, axC8 = plt.subplots(figsize=(7, 5))
-    figC8.suptitle('Energy distribution — %d realisations  (final snapshot)' % n_runs)
     for g in groups:
         E = g["d"]["E_final"]
         E_bound   = E[E <= 0]
@@ -374,11 +411,87 @@ if COMBINED_MODE:
     axC8.axvline(0, color='k', ls='--', label='E=0')
     axC8.set_xlabel('specific energy E')
     axC8.set_ylabel('probability density')
-    axC8.set_title('blue = bound,  red = unbound')
+    axC8.set_title('Energy distribution — %d realisations  (final snapshot)' % n_runs)
     axC8.legend(); axC8.grid(True)
     plt.tight_layout()
     out = os.path.join(outdir, "combined_energy.pdf")
     plt.savefig(out); plt.close(figC8)
+    print("Saved: %s" % out)
+
+    # ---- FIG C9: goodness-of-fit distributions across runs ----
+    # [PHYSICS] For each test, collect per-run chi2_nu values and plot their
+    # distribution. Then compute chi2_nu on the MEDIAN profile across runs —
+    # which should be closer to theory than any individual run.
+
+    # collect per-run scalars
+    chi2_rho_arr  = np.array([float(g["d"]["chi2_rho"])  for g in groups])
+    chi2_q_arr    = np.array([float(g["d"]["chi2_q"])    for g in groups])
+    chi2_sigr_arr = np.array([float(g["d"]["chi2_sigr"]) for g in groups])
+    chi2_sigt_arr = np.array([float(g["d"]["chi2_sigt"]) for g in groups])
+    ks_arr        = np.array([float(g["d"]["ks_stat_vc"]) for g in groups])
+
+    # --- median density profile chi2 ---
+    rho_stack  = np.array([g["d"]["rho_profile"] for g in groups])
+    cnt_stack  = np.array([g["d"]["rho_cnt"]     for g in groups])
+    r_mid_rho  = groups[0]["d"]["rho_r_mid"]
+    rho_med    = np.nanmedian(rho_stack, axis=0)
+    rho_th_med = plummer_rho(r_mid_rho, M_tot, b_c)
+    vol_med    = (4.0/3.0)*np.pi*(np.diff(np.concatenate([
+                    [r_mid_rho[0]**2/r_mid_rho[1]],
+                    np.sqrt(r_mid_rho[:-1]*r_mid_rho[1:]),
+                    [r_mid_rho[-1]**2/r_mid_rho[-2]]
+                ]))**3 * 0)   # placeholder — use theory counts directly
+    cnt_th_med = rho_th_med * np.nanmedian(cnt_stack / np.where(rho_stack>0, rho_stack, np.nan), axis=0)
+    cnt_th_med = np.where(np.isfinite(cnt_th_med) & (cnt_th_med>0), cnt_th_med, 1.0)
+    sig_rho_med = rho_th_med / np.sqrt(cnt_th_med)
+    chi2_rho_med, _ = compute_reduced_chi2(rho_med, rho_th_med, sig_rho_med, dof_adj=0)
+
+    # --- median Jeans profile chi2 ---
+    sigr_stack = np.array([g["d"]["jeans_sigr"] for g in groups])
+    sigt_stack = np.array([g["d"]["jeans_sigt"] for g in groups])
+    cnt_j_stack= np.array([g["d"]["jeans_cnt"] if "jeans_cnt" in g["d"].files else np.full(len(g["d"]["jeans_r_mid"]), 50.0)  for g in groups])
+    r_mid_j_c  = groups[0]["d"]["jeans_r_mid"]
+    sigr_med   = np.nanmedian(sigr_stack, axis=0)
+    sigt_med   = np.nanmedian(sigt_stack, axis=0)
+    cnt_j_med  = np.nanmedian(cnt_j_stack, axis=0)
+    sig_th_j_med = np.sqrt(G * M_tot / (6.0 * np.sqrt(r_mid_j_c**2 + b_c**2)))
+    sig_err_j_med = sig_th_j_med / np.sqrt(2.0 * np.maximum(cnt_j_med - 1, 1))
+    chi2_sigr_med, _ = compute_reduced_chi2(sigr_med, sig_th_j_med, sig_err_j_med, dof_adj=0)
+    chi2_sigt_med, _ = compute_reduced_chi2(sigt_med, sig_th_j_med, sig_err_j_med, dof_adj=0)
+
+    # --- median P(q) chi2 ---
+    q_stack  = np.array([g["d"]["q_hist"] for g in groups])
+    q_med    = np.nanmedian(q_stack, axis=0)
+    q_mid_c  = groups[0]["d"]["q_mid"]
+    q_th_c   = q_mid_c**2 * (1.0 - q_mid_c**2)**3.5
+    q_th_c  *= np.nansum(q_med) / np.sum(q_th_c)
+    chi2_q_med, _ = compute_reduced_chi2(
+        q_med, q_th_c, np.sqrt(np.maximum(q_th_c, 1)), dof_adj=1)
+
+    figC9, axes9 = plt.subplots(1, 4, figsize=(16, 5))
+
+    panels = [
+        (axes9[0], chi2_rho_arr,  chi2_rho_med,  'chi2_nu  density rho(r)'),
+        (axes9[1], chi2_q_arr,    chi2_q_med,    'chi2_nu  velocity dist P(q)'),
+        (axes9[2], chi2_sigr_arr, chi2_sigr_med, 'chi2_nu  Jeans sigma_r'),
+        (axes9[3], chi2_sigt_arr, chi2_sigt_med, 'chi2_nu  Jeans sigma_t'),
+    ]
+
+    for ax, arr, med_val, xlabel in panels:
+        valid = arr[np.isfinite(arr)]
+        ax.hist(valid, bins=max(5, n_runs//3), color='k', alpha=0.6, density=False)
+        ax.axvline(1.0,     color='r',  ls='--', lw=1.5, label='ideal = 1')
+        ax.axvline(med_val, color='b',  ls='-',  lw=1.5,
+                   label='median profile  chi2=%.2f' % med_val)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel('runs')
+        ax.legend(fontsize=7)
+        ax.grid(True)
+
+    axes9[0].set_title('Per-run $\\chi^2_\\nu$ distributions  (%d runs)' % n_runs)
+    plt.tight_layout()
+    out = os.path.join(outdir, "combined_chi2.pdf")
+    plt.savefig(out); plt.close(figC9)
     print("Saved: %s" % out)
 
     print(f"\nAll combined plots written to: {outdir}/")
@@ -468,7 +581,7 @@ def lagrangian_radii(pos, cm, fracs):
 def velocity_stats(pos, vel):
     """
     Velocity dispersions and mean radial velocity, all in the CM frame.
-    Returns: sigma_v (total 3D), sigma_vr (radial), sigma_vt (1D tangential), <v_r>
+    Returns: sigma_v (total 3D), sigma_vr (radial), sigma_theta (1D tangential), <v_r>
     """
     pos_cm = np.mean(pos, axis=0)
     vel_cm = np.mean(vel, axis=0)
@@ -501,20 +614,15 @@ def bin_density_profile(pos, cm, mass_per_p, n_bins=35):
     return r_mid[ok], rho[ok], counts[ok]
 
 
-def plummer_rho(r, M, b):
-    """
-    Analytical Plummer density:
-      rho(r) = (3M / 4 pi b^3) * (1 + r^2/b^2)^{-5/2}
-    """
-    return (3.0*M/(4.0*math.pi*b**3)) * (1.0 + (r/b)**2)**(-2.5)
+# plummer_rho defined above (shared helper)
 
 
 def anisotropy_profile(pos, vel, n_bins=15):
     """
-    Compute sigma_t(1D)/sigma_r in radial shells.
+    Compute sigma_theta/sigma_r in radial shells.
     [PHYSICS] For an isotropic velocity distribution this ratio = 1.0 everywhere.
-    sigma_t(1D) = sqrt( mean(v_t^2) / 2 ) — the factor 1/2 converts 2D
-    tangential variance to one component.
+    sigma_theta = sqrt( mean(v_t^2) / 2 ) — the 1/2 converts 2D tangential
+    variance to one component (sigma_theta = sigma_phi by spherical symmetry).
     All velocities computed in the instantaneous CM frame.
     """
     cm     = np.mean(pos, axis=0)
@@ -574,39 +682,7 @@ def jeans_profile(pos, vel, n_bins=18):
     return r_mid, sig_r, sig_t, ratio, counts
 
 
-def compute_reduced_chi2(obs, exp, sigma, dof_adj=0):
-    """
-    Reduced chi-squared (chi2/nu) and p-value.
-
-    Uses the standard Pearson formulation: each term is (O-E)^2 / sigma^2
-    where sigma should be based on the EXPECTED value (e.g. rho_th/sqrt(N_bin))
-    to avoid instability when observed counts fluctuate near zero.
-
-    Parameters
-    ----------
-    obs, exp, sigma : array-like
-        Observed values, expected values, and per-bin uncertainties.
-    dof_adj : int
-        Number of constraints imposed that reduce the DOF (e.g. 1 if the
-        theory was renormalised to match the data total).
-        Default 0: use unless a parameter was explicitly fitted/normalised.
-
-    Returns
-    -------
-    chi2_nu : float  (reduced chi-squared = chi2 / nu)
-    p_val   : float  (p-value from chi2 CDF with nu = n_bins - dof_adj DOF)
-    """
-    obs   = np.asarray(obs,   dtype=float)
-    exp   = np.asarray(exp,   dtype=float)
-    sigma = np.asarray(sigma, dtype=float)
-    mask  = (exp > 0) & (sigma > 0) & np.isfinite(obs) & np.isfinite(exp)
-    n_eff = int(mask.sum())
-    if n_eff <= dof_adj:
-        return np.nan, np.nan
-    chi2  = np.sum(((obs[mask] - exp[mask]) / sigma[mask])**2)
-    dof   = n_eff - dof_adj
-    p_val = 1.0 - stats.chi2.cdf(chi2, dof)
-    return chi2 / dof, p_val
+# compute_reduced_chi2 defined above (shared helper)
 
 
 def get_mid_snapshot(filepath, N, t_target, has_phi=True):
@@ -865,7 +941,8 @@ print(f"  Max |Delta_E/E| = {energy_err:.2e}  "
 
 r_hm_t       = lag_mat[:, LAG_FRACS.index(0.50)]
 r_hm_initial = r_hm_t[0]
-r_hm_drift   = (r_hm_t[-1] - r_hm_initial) / r_hm_initial
+r_hm_median  = float(np.nanmedian(r_hm_t))
+r_hm_offset  = (r_hm_median - r_hm_theory) / r_hm_theory
 sv_drift     = (sigma_v[-1] - sigma_v[0]) / sigma_v[0]
 virial_mean  = float(np.nanmean(virial_ratio))
 virial_std   = float(np.nanstd(virial_ratio))
@@ -874,10 +951,11 @@ ratio_mean = float(np.nanmean(ratio_final)) if len(ratio_final) > 0 else np.nan
 
 print(f"\nSTABILITY SUMMARY")
 print(f"  r_hm(t=0)                = {r_hm_initial:.4f}  (theory = {r_hm_theory:.4f})")
-print(f"  r_hm drift               = {100*r_hm_drift:+.2f}%")
+print(f"  r_hm median (all snaps)  = {r_hm_median:.4f}")
+print(f"  r_hm offset              = {100*r_hm_offset:+.2f}%")
 print(f"  sigma_v drift            = {100*sv_drift:+.2f}%")
 print(f"  Mean 2K/|W|              = {virial_mean:.4f} +/- {virial_std:.4f}")
-print(f"  Mean σ_t/σ_r (final snap)= {ratio_mean:.4f}  (1.0 is isotropic)")
+print(f"  Mean σ_θ/σ_r (final snap)= {ratio_mean:.4f}  (1.0 is isotropic)")
 
 
 # ============================================================
@@ -1083,7 +1161,7 @@ print("Saved: summary_mass_vcirc.pdf")
 # ============================================================
 # [PHYSICS] Plummer DF: f(E) ~ (-E)^{7/2} => P(q) ~ q^2*(1-q^2)^{7/2}
 # q = v/v_esc(r),  v_esc(r) = sqrt(-2 phi(r))
-# t=0 panel verifies IC sampling. t=final panel checks for drift
+# t=0 panel verifies IC sampling. t=final panel checks for systematic offset
 # due to two-body relaxation or numerical heating.
 
 if phi_initial is not None and phi_last is not None:
@@ -1122,7 +1200,7 @@ if phi_initial is not None and phi_last is not None:
 # ============================================================
 # [PHYSICS] Isotropic Jeans equation for Plummer sphere:
 #   sigma_r^2(r) = G M_tot / (6 sqrt(r^2 + b^2))
-# Lower panel: sigma_t(1D)/sigma_r — must be ~1.0 (isotropy).
+# Lower panel: sigma_theta/sigma_r — must be ~1.0 (isotropy).
 
 sigma_theory_jeans = lambda r_arr: np.sqrt(G * M_tot / (6.0 * np.sqrt(r_arr**2 + b**2)))
 
@@ -1153,19 +1231,19 @@ for col, (label, pos_s, vel_s) in enumerate([
     ax_top.errorbar(r_mid_j, sig_r_j, yerr=sig_err_j,
                     fmt='o', ms=3, color='blue',  label='σ_r')
     ax_top.errorbar(r_mid_j, sig_t_j, yerr=sig_err_j,
-                    fmt='s', ms=3, color='green', label='σ_t(1D)')
+                    fmt='s', ms=3, color='green', label='σ_θ')
     ax_top.set_xscale('log')
     ax_top.set_ylabel('σ')
     ax_top.set_title(label)
     ax_top.legend(fontsize=8)
     ax_top.grid(True)
 
-    ax_bot.axhline(1.0, color='k', ls='--', label='σ_t(1D) / σ_r = 1')
+    ax_bot.axhline(1.0, color='k', ls='--', label='σ_θ / σ_r = 1')
     ax_bot.scatter(r_mid_j, ratio_j, color='purple', s=15)
     ax_bot.set_xscale('log')
     ax_bot.set_ylim(0.5, 1.5)
     ax_bot.set_xlabel('r')
-    ax_bot.set_ylabel('σ_t(1D) / σ_r')
+    ax_bot.set_ylabel('σ_θ / σ_r')
     ax_bot.legend(fontsize=8)
     ax_bot.grid(True)
 
@@ -1179,7 +1257,7 @@ print("Saved: summary_jeans.pdf")
 #  FIGURE 7: LAGRANGIAN RADII vs TIME
 # ============================================================
 # [PHYSICS] Flat Lagrangian radii = stable equilibrium.
-# Secular drift signals: wrong softening, two-body relaxation, or
+# Secular trends signal: wrong softening, two-body relaxation, or
 # ICs out of equilibrium.
 # Left: absolute radii vs analytical predictions (dashed).
 # Right: normalised to t=0 so drift is immediately visible.
@@ -1206,7 +1284,7 @@ ax7a.grid(True)
 ax7b.axhline(1.0, color='k', ls='--', label='= 1')
 ax7b.set_xlabel('time  [t_dyn]')
 ax7b.set_ylabel('r / r(t=0)')
-ax7b.set_title('normalised drift') # = 1 means stable
+ax7b.set_title('normalised  (= 1 means stable)')
 ax7b.legend(fontsize=8)
 ax7b.grid(True)
 
@@ -1241,7 +1319,7 @@ ax8a.grid(True)
 
 ax8b.plot(times / t_dyn, sigma_v,  'b-',  label='sigma_v total')
 ax8b.plot(times / t_dyn, sigma_vr, 'b--', label='sigma_vr')
-ax8b.plot(times / t_dyn, sigma_vt, 'b:',  label='sigma_vt (1D)')
+ax8b.plot(times / t_dyn, sigma_vt, 'b:',  label='sigma_theta')
 ax8b.axhline(sv_theory, color='k', ls='--', label='theory = %.4f' % sv_theory)
 ax8b.set_xlabel('time  [t_dyn]')
 ax8b.set_ylabel('velocity dispersion')
@@ -1266,7 +1344,7 @@ print("Saved: summary_velocities.pdf")
 # ============================================================
 #  FIGURE 9: VELOCITY DISPERSION RATIO — initial and final
 # ============================================================
-# [PHYSICS] sigma_t(1D)/sigma_r = 1 everywhere for an isotropic sphere.
+# [PHYSICS] sigma_theta/sigma_r = 1 everywhere for an isotropic sphere.
 # Wider adaptive radial range than Fig 6 — useful for detecting
 # anisotropy in the halo where Jeans bins are underpopulated.
 
@@ -1281,12 +1359,12 @@ for ax, label, pos_s, vel_s in [
     if len(r_b) > 0:
         ax.scatter(r_b, ratio_b, color='blue', s=20)
         ax.plot(r_b, ratio_b, 'b-', alpha=0.5)
-    ax.axhline(1.0, color='k', ls='--', label='σ_t(1D) / σ_r = 1 (isotropic)')
+    ax.axhline(1.0, color='k', ls='--', label='σ_θ / σ_r = 1  (isotropic)')
     ax.axvline(b, color='orange', ls=':', label='r=b (softening)')
     ax.set_xscale('log')
     ax.set_ylim(0.5, 1.5)
     ax.set_xlabel('r')
-    ax.set_ylabel('σ_t(1D) / σ_r')
+    ax.set_ylabel('σ_θ / σ_r')
     ax.set_title(label)
     ax.legend()
     ax.grid(True)
@@ -1311,9 +1389,10 @@ fig10.suptitle('Scalar stability metrics  (N=%d, b=%.1f, eps=0.012,  %.1f t_dyn)
 
 ax10a.plot(times / t_dyn, r_hm_t, 'b-', label='r_hm (sim)')
 ax10a.axhline(r_hm_theory, color='r', ls='--', label='theory = %.4f' % r_hm_theory)
+ax10a.axhline(r_hm_median,   color='k', ls=':',  label='median = %.4f' % r_hm_median)
 ax10a.set_xlabel('time  [t_dyn]')
 ax10a.set_ylabel('r_hm')
-ax10a.set_title('half-mass radius  (drift = %.2f%%)' % (100*r_hm_drift))
+ax10a.set_title('half-mass radius  (offset = %+.2f%%)' % (100*r_hm_offset))
 ax10a.legend()
 ax10a.grid(True)
 
@@ -1479,11 +1558,12 @@ print("=" * 65)
 print(f"  Snapshots:           {len(times)}")
 print(f"  Time span:           {times[-1]:.4f}  ({times[-1]/t_dyn:.1f} t_dyn)")
 print(f"  r_hm(t=0):           {r_hm_initial:.4f}  (theory = {r_hm_theory:.4f})")
-print(f"  r_hm drift:          {100*r_hm_drift:+.2f}%")
+print(f"  r_hm median (all snaps):{r_hm_median:.4f}")
+print(f"  r_hm offset:         {100*r_hm_offset:+.2f}%")
 print(f"  sigma_v(t=0):        {sigma_v[0]:.4f}  (theory = {sv_theory:.4f})")
 print(f"  sigma_v drift:       {100*sv_drift:+.2f}%")
 print(f"  Mean 2K/|W|:         {virial_mean:.4f} +/- {virial_std:.4f}")
-print(f"  Mean σ_t/σ_r (final):{ratio_mean:.4f}  (1.0 is isotropic)")
+print(f"  Mean σ_θ/σ_r (final):{ratio_mean:.4f}  (1.0 is isotropic)")
 print(f"  Max |Delta_E/E|:     {energy_err:.2e}  "
       f"({'PASS' if is_good else 'FAIL'})")
 if phi_last is not None:
@@ -1522,7 +1602,7 @@ _rho     = np.where(_cnt > 0, _cnt * mass / _vol, np.nan)
 _r_mid_d = np.sqrt(_bins_d[:-1] * _bins_d[1:])
 
 # --- Jeans / ratio profile at INITIAL snapshot (fixed log bins) ---
-_r_mid_j, _sigr, _sigt, _ratio_j, _ = jeans_profile(pos_initial, vel_initial, n_bins=20)
+_r_mid_j, _sigr, _sigt, _ratio_j, _jeans_cnt_i = jeans_profile(pos_initial, vel_initial, n_bins=20)
 
 # --- circular velocity at INITIAL snapshot ---
 _r_sorted2  = np.sort(_r_i0)
@@ -1565,7 +1645,8 @@ np.savez(
     mean_vr       = mean_vr_t,
     energy_abs    = energy_abs,
     # scalar stability metrics
-    r_hm_drift    = np.array(r_hm_drift),
+    r_hm_median   = np.array(r_hm_median),
+    r_hm_offset   = np.array(r_hm_offset),
     sigma_v_drift = np.array(sv_drift),
     virial_mean   = np.array(virial_mean),
     virial_std    = np.array(virial_std),
@@ -1575,6 +1656,7 @@ np.savez(
     # IC-verification profiles (initial snapshot, fixed bins)
     rho_r_mid     = _r_mid_d,
     rho_profile   = _rho,
+    rho_cnt       = _cnt.astype(float),
     jeans_r_mid   = _r_mid_j,
     jeans_sigr    = _sigr,
     jeans_sigt    = _sigt,
